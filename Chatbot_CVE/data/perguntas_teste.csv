@@ -1,0 +1,11 @@
+id,pergunta,tipo,resposta_esperada,observacao
+1,CVE-2021-44228 é crítico?,id_direto,,Confirmar severidade e pontuação direto na NVD
+2,Me fale sobre o CVE-2014-0160,id_direto,,
+3,CVE-1999-0001,id_direto,,Escolher um ID que exista e conferir na NVD
+4,CVE-2099-99999,id_inexistente,,Esperado: bot informar que não encontrou
+5,buscar log4j crítica,palavra_chave,,Conferir total e primeiros resultados na NVD
+6,buscar openssl alta,palavra_chave,,
+7,cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*,cpe,,Conferir lista de CVEs na NVD
+8,tem vulnerabilidade crítica no log4j?,linguagem_natural,,Versão por regras deve falhar; testa a IA
+9,o Chrome tem falha grave conhecida?,linguagem_natural,,Exige mapear produto para CPE
+10,e a versão 2.14 do log4j?,ambigua,,Depende de contexto da conversa
