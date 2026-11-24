@@ -1,4 +1,7 @@
-"""Versão B do bot: IA generativa com chamada de ferramentas (tool use).
+"""Versão B do bot: IA generativa via GitHub Models (gratuito com conta GitHub).
+
+Usa a API de chat do GitHub Models, que segue o formato "OpenAI compatível",
+com chamada de ferramentas (tool calling).
 
 Fluxo:
 1. O usuário escreve livremente.
@@ -6,12 +9,13 @@ Fluxo:
 3. Nosso código executa a ferramenta usando o mesmo NVDClient da versão A.
 4. O resultado volta ao modelo, que redige a resposta em português.
 
-O modelo NÃO deve responder de memória: o prompt de sistema o obriga a usar
-apenas os dados retornados pela NVD.
+O prompt de sistema obriga o modelo a usar apenas os dados retornados pela NVD.
 
 Configuração (arquivo .env):
-- ANTHROPIC_API_KEY (ou LLM_API_KEY): chave da API da Anthropic
-- LLM_MODEL: opcional; modelo a usar (padrão abaixo)
+- GITHUB_MODELS_TOKEN (ou LLM_API_KEY): token de acesso pessoal do GitHub com a
+  permissão "Models: read"
+- LLM_MODEL: opcional; ID do modelo no formato publisher/nome (padrão abaixo)
+- LLM_ENDPOINT: opcional; URL da API (padrão abaixo)
 
 Para trocar de provedor no futuro, basta reescrever esta classe mantendo o
 método responder(pergunta) -> EngineResponse.
@@ -22,13 +26,17 @@ from __future__ import annotations
 import json
 import os
 
+import requests
+
 from .models import EngineResponse
 from .nvd_client import NVDClient, NVDError
 
-MODELO_PADRAO = "claude-haiku-5-5"  # econômico; confirme nomes atuais na documentação
+ENDPOINT_PADRAO = "https://models.github.ai/inference/chat/completions"
+MODELO_PADRAO = "openai/gpt-4o-mini"  # modelo "low tier": limites gratuitos maiores
 MAX_ITERACOES = 5  # limite de idas e vindas com ferramentas por pergunta
 MAX_TOKENS_RESPOSTA = 1024
-DESCRICAO_MAX = 350  # caracteres de descrição enviados ao modelo (economiza tokens)
+DESCRICAO_MAX = 350  # caracteres de descrição enviados ao modelo
+TIMEOUT = 60
 
 SYSTEM_PROMPT = """\
 Você ajuda analistas de suporte de TI a consultar vulnerabilidades (CVE) na base NVD do NIST.
@@ -52,11 +60,11 @@ _SEVERIDADE = {
     "description": "Filtro opcional de severidade CVSS v3.",
 }
 
-TOOLS = [
+_FERRAMENTAS = [
     {
         "name": "buscar_cve_por_id",
         "description": "Busca um CVE específico pelo ID, por exemplo CVE-2021-44228.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {"cve_id": {"type": "string", "description": "ID do CVE."}},
             "required": ["cve_id"],
@@ -68,7 +76,7 @@ TOOLS = [
             "Busca CVEs cujo texto de descrição contenha a palavra-chave (nome de produto em inglês). "
             "Retorna até 10 resultados, ordenados por pontuação, e o total existente na NVD."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "palavra_chave": {"type": "string", "description": "Ex.: 'apache log4j', 'openssl'."},
@@ -84,7 +92,7 @@ TOOLS = [
             "cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*. Use somente quando o produto e a versão "
             "forem conhecidos com precisão."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "cpe_name": {"type": "string", "description": "CPE 2.3 completo."},
@@ -95,8 +103,11 @@ TOOLS = [
     },
 ]
 
+# Formato esperado pela API (estilo OpenAI)
+TOOLS = [{"type": "function", "function": f} for f in _FERRAMENTAS]
 
-class _ConfigError(Exception):
+
+class _LLMHTTPError(Exception):
     def __init__(self, mensagem: str, codigo: str) -> None:
         super().__init__(mensagem)
         self.codigo = codigo
@@ -106,29 +117,52 @@ class LLMEngine:
     def __init__(self, nvd: NVDClient, modelo: str | None = None) -> None:
         self.nvd = nvd
         self.modelo = modelo or os.getenv("LLM_MODEL") or MODELO_PADRAO
-        self._client = None
-        self._anthropic = None
+        self.endpoint = os.getenv("LLM_ENDPOINT") or ENDPOINT_PADRAO
 
     # ------------------------------------------------------------------
-    def _get_client(self):
-        if self._client is not None:
-            return self._client
-        try:
-            import anthropic
-        except ImportError as exc:
-            raise _ConfigError(
-                "O pacote `anthropic` não está instalado. Rode `pip install -r requirements.txt`.",
-                "sdk_ausente",
-            ) from exc
-        chave = os.getenv("LLM_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
-        if not chave:
-            raise _ConfigError(
-                "Chave da IA não configurada. Defina ANTHROPIC_API_KEY no arquivo `.env` e reinicie o app.",
+    def _chamar_api(self, messages: list[dict]) -> dict:
+        token = os.getenv("GITHUB_MODELS_TOKEN") or os.getenv("LLM_API_KEY")
+        if not token:
+            raise _LLMHTTPError(
+                "Token da IA não configurado. Defina GITHUB_MODELS_TOKEN no arquivo `.env` e reinicie o app.",
                 "sem_chave_llm",
             )
-        self._anthropic = anthropic
-        self._client = anthropic.Anthropic(api_key=chave)
-        return self._client
+        corpo = {
+            "model": self.modelo,
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *messages],
+            "tools": TOOLS,
+            "tool_choice": "auto",
+            "max_tokens": MAX_TOKENS_RESPOSTA,
+            "temperature": 0,  # respostas mais estáveis, melhor para comparar
+        }
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        try:
+            resp = requests.post(self.endpoint, headers=headers, json=corpo, timeout=TIMEOUT)
+        except requests.RequestException as exc:
+            raise _LLMHTTPError(f"Falha de rede ao chamar a IA: {exc}", "llm_rede") from exc
+
+        if resp.status_code == 200:
+            try:
+                return resp.json()
+            except ValueError as exc:
+                raise _LLMHTTPError("A IA retornou uma resposta inválida (JSON).", "llm_error") from exc
+        if resp.status_code in (401, 403):
+            raise _LLMHTTPError(
+                "Token recusado. Confira se ele está correto e tem a permissão `Models: read`.",
+                "llm_auth",
+            )
+        if resp.status_code == 429:
+            raise _LLMHTTPError(
+                "Limite de uso gratuito da IA atingido. Aguarde alguns minutos (ou até o dia seguinte).",
+                "llm_limite",
+            )
+        if resp.status_code == 413:
+            raise _LLMHTTPError("A requisição excedeu o tamanho máximo permitido pelo modelo.", "llm_tamanho")
+        raise _LLMHTTPError(f"Erro da IA: HTTP {resp.status_code} - {resp.text[:200]}", "llm_error")
 
     # ------------------------------------------------------------------
     def responder(self, pergunta: str) -> EngineResponse:
@@ -136,29 +170,25 @@ class LLMEngine:
         if not pergunta:
             return EngineResponse("Digite uma pergunta.", ok=False, erro="entrada_vazia")
 
-        try:
-            client = self._get_client()
-        except _ConfigError as exc:
-            return EngineResponse(str(exc), ok=False, erro=exc.codigo)
-
         messages: list[dict] = [{"role": "user", "content": pergunta}]
         cves_usados: dict[str, dict] = {}
         tokens_in = tokens_out = 0
 
         try:
             for _ in range(MAX_ITERACOES):
-                resp = client.messages.create(
-                    model=self.modelo,
-                    max_tokens=MAX_TOKENS_RESPOSTA,
-                    system=SYSTEM_PROMPT,
-                    tools=TOOLS,
-                    messages=messages,
-                )
-                tokens_in += resp.usage.input_tokens
-                tokens_out += resp.usage.output_tokens
+                dados = self._chamar_api(messages)
+                uso = dados.get("usage") or {}
+                tokens_in += int(uso.get("prompt_tokens", 0))
+                tokens_out += int(uso.get("completion_tokens", 0))
 
-                if resp.stop_reason != "tool_use":
-                    texto = "".join(b.text for b in resp.content if b.type == "text").strip()
+                escolhas = dados.get("choices") or []
+                if not escolhas:
+                    raise _LLMHTTPError("A IA não retornou nenhuma resposta.", "resposta_vazia")
+                msg = escolhas[0].get("message") or {}
+                chamadas = msg.get("tool_calls") or []
+
+                if not chamadas:
+                    texto = (msg.get("content") or "").strip()
                     return EngineResponse(
                         texto or "O modelo não retornou texto.",
                         list(cves_usados.values()),
@@ -168,17 +198,19 @@ class LLMEngine:
                         tokens_saida=tokens_out,
                     )
 
-                messages.append({"role": "assistant", "content": resp.content})
-                resultados = []
-                for bloco in resp.content:
-                    if bloco.type != "tool_use":
-                        continue
-                    conteudo, erro = self._executar_ferramenta(bloco.name, bloco.input, cves_usados)
-                    item = {"type": "tool_result", "tool_use_id": bloco.id, "content": conteudo}
-                    if erro:
-                        item["is_error"] = True
-                    resultados.append(item)
-                messages.append({"role": "user", "content": resultados})
+                messages.append(
+                    {"role": "assistant", "content": msg.get("content"), "tool_calls": chamadas}
+                )
+                for chamada in chamadas:
+                    funcao = chamada.get("function", {})
+                    try:
+                        entrada = json.loads(funcao.get("arguments") or "{}")
+                        conteudo = self._executar_ferramenta(funcao.get("name", ""), entrada, cves_usados)
+                    except json.JSONDecodeError:
+                        conteudo = "Erro: argumentos da ferramenta não são um JSON válido."
+                    messages.append(
+                        {"role": "tool", "tool_call_id": chamada.get("id", ""), "content": conteudo}
+                    )
 
             return EngineResponse(
                 "Não consegui concluir a consulta (muitas chamadas de ferramenta).",
@@ -189,29 +221,29 @@ class LLMEngine:
                 tokens_saida=tokens_out,
             )
 
-        except Exception as exc:  # noqa: BLE001 - queremos registrar qualquer falha no log
-            api_error = getattr(self._anthropic, "APIError", None)
-            codigo = "llm_error" if api_error and isinstance(exc, api_error) else "erro_inesperado"
+        except _LLMHTTPError as exc:
             return EngineResponse(
-                f"Erro ao consultar a IA: {exc}",
+                str(exc), ok=False, erro=exc.codigo, tokens_entrada=tokens_in, tokens_saida=tokens_out
+            )
+        except Exception as exc:  # noqa: BLE001 - queremos registrar qualquer falha no log
+            return EngineResponse(
+                f"Erro inesperado na versão com IA: {exc}",
                 ok=False,
-                erro=codigo,
+                erro="erro_inesperado",
                 tokens_entrada=tokens_in,
                 tokens_saida=tokens_out,
             )
 
     # ------------------------------------------------------------------
-    def _executar_ferramenta(
-        self, nome: str, entrada: dict, cves_usados: dict[str, dict]
-    ) -> tuple[str, bool]:
-        """Executa uma ferramenta pedida pelo modelo. Retorna (texto, houve_erro)."""
+    def _executar_ferramenta(self, nome: str, entrada: dict, cves_usados: dict[str, dict]) -> str:
+        """Executa uma ferramenta pedida pelo modelo e devolve o texto do resultado."""
         try:
             if nome == "buscar_cve_por_id":
                 cve = self.nvd.get_cve(entrada["cve_id"])
                 if cve is None:
-                    return _json({"encontrado": False}), False
+                    return _json({"encontrado": False})
                 cves_usados[cve["id"]] = cve
-                return _json({"encontrado": True, "cve": _compacto(cve)}), False
+                return _json({"encontrado": True, "cve": _compacto(cve)})
 
             if nome == "buscar_cves_por_palavra_chave":
                 cves, total = self.nvd.search_keyword(
@@ -220,18 +252,18 @@ class LLMEngine:
             elif nome == "buscar_cves_por_cpe":
                 cves, total = self.nvd.search_cpe(entrada["cpe_name"], entrada.get("severidade"))
             else:
-                return f"Ferramenta desconhecida: {nome}", True
+                return f"Erro: ferramenta desconhecida: {nome}"
 
             for cve in cves:
                 cves_usados[cve["id"]] = cve
             return _json(
                 {"total_na_nvd": total, "exibidos": len(cves), "cves": [_compacto(c) for c in cves]}
-            ), False
+            )
 
         except KeyError as exc:
-            return f"Parâmetro obrigatório ausente: {exc}", True
+            return f"Erro: parâmetro obrigatório ausente: {exc}"
         except NVDError as exc:
-            return f"Erro ao consultar a NVD: {exc}", True
+            return f"Erro ao consultar a NVD: {exc}"
 
 
 def _compacto(cve: dict) -> dict:
