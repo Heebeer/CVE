@@ -11,3 +11,6 @@ class EngineResponse:
     cves: list[dict] = field(default_factory=list)
     ok: bool = True
     erro: str | None = None
+    # Preenchidos apenas pela versão com IA; servem para medir custo no TCC.
+    tokens_entrada: int = 0
+    tokens_saida: int = 0
