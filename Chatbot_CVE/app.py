@@ -75,7 +75,7 @@ with st.sidebar:
 # ----------------------------------------------------------------------
 # Chat
 # ----------------------------------------------------------------------
-st.title("🛡️ Consulta de Vulnerabilidades (CVE)")
+st.title("🛡️ Consulta de CVE")
 st.caption("Dados da NVD (NIST). Descrições em inglês, como publicadas na fonte.")
 
 if "historico" not in st.session_state:
