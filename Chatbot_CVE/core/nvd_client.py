@@ -17,6 +17,8 @@ import os
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -25,6 +27,12 @@ JANELA_SEGUNDOS = 30
 LIMITE_SEM_CHAVE = 5
 LIMITE_COM_CHAVE = 50
 SEVERIDADES_VALIDAS = {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
+
+# Busca por recência: a NVD limita filtros de data a 120 dias consecutivos, então
+# consultamos "janelas" de 119 dias, da mais recente para trás, até achar resultados.
+JANELA_DIAS = 119
+MAX_JANELAS = 3  # ~1 ano de histórico
+PAGINA = 100  # resultados por requisição
 
 # Ordem de preferência ao escolher qual pontuação CVSS exibir.
 _METRICAS_PREFERIDAS = (
@@ -37,6 +45,17 @@ _METRICAS_PREFERIDAS = (
 
 class NVDError(Exception):
     """Erro ao consultar a NVD (rede, limite de requisições, chave inválida etc.)."""
+
+
+@dataclass
+class ResultadoBusca:
+    cves: list[dict]  # até `limite` CVEs, já ordenados
+    total: int  # total de correspondências no período consultado
+    dias: int | None  # período consultado em dias (None = sem filtro de data)
+
+
+def _fmt_data(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.000")  # UTC, formato aceito pela NVD
 
 
 class NVDClient:
@@ -71,42 +90,86 @@ class NVDClient:
 
     def search_keyword(
         self, palavra_chave: str, severidade: str | None = None, limite: int = 10
-    ) -> tuple[list[dict], int]:
-        """Busca CVEs por palavra-chave na descrição.
+    ) -> ResultadoBusca:
+        """Busca CVEs por palavra-chave na descrição, priorizando os mais RECENTES.
 
-        Retorna (lista de CVEs, total encontrado na NVD).
+        A NVD não ordena por relevância nem por data: devolve os mais antigos primeiro.
+        Por isso a busca é feita em janelas de datas, da mais recente para trás, e os
+        candidatos encontrados são ordenados por pontuação CVSS (e, em empate, por data).
         """
-        return self._buscar({"keywordSearch": palavra_chave}, severidade, limite)
+        return self._buscar_recentes({"keywordSearch": palavra_chave}, severidade, limite)
 
     def search_cpe(
         self, cpe_name: str, severidade: str | None = None, limite: int = 10
-    ) -> tuple[list[dict], int]:
-        """Busca CVEs que afetam um CPE 2.3 completo.
+    ) -> ResultadoBusca:
+        """Busca CVEs que afetam um CPE 2.3 completo, sem filtro de data.
 
         Exemplo: cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*
+        O resultado são os CVEs daquele produto/versão, então a data não é filtrada.
         """
-        return self._buscar({"cpeName": cpe_name}, severidade, limite)
+        params = self._com_severidade({"cpeName": cpe_name}, severidade)
+        itens, total = self._pagina_final(params)
+        cves = [self._simplificar(i) for i in itens]
+        return ResultadoBusca(_melhores(cves, limite), total, None)
 
     # ------------------------------------------------------------------
     # Internos
     # ------------------------------------------------------------------
-    def _buscar(
-        self, params: dict, severidade: str | None, limite: int
-    ) -> tuple[list[dict], int]:
+    @staticmethod
+    def _com_severidade(params: dict, severidade: str | None) -> dict:
         params = dict(params)
-        params["resultsPerPage"] = 100
         if severidade:
             severidade = severidade.upper()
             if severidade not in SEVERIDADES_VALIDAS:
                 raise NVDError(f"Severidade inválida: {severidade}")
             params["cvssV3Severity"] = severidade
+        return params
 
-        dados = self._get(params)
-        cves = [self._simplificar(item) for item in dados.get("vulnerabilities", [])]
-        # A NVD não ordena por gravidade. Ordenamos aqui, mas apenas entre os
-        # (até) 100 resultados retornados nesta página. Isso é uma limitação.
-        cves.sort(key=lambda c: c["score"] if c["score"] is not None else -1, reverse=True)
-        return cves[:limite], int(dados.get("totalResults", len(cves)))
+    def _pagina_final(self, params: dict) -> tuple[list[dict], int]:
+        """Retorna (itens, total). Se houver mais de PAGINA resultados, pega a ÚLTIMA página.
+
+        Como a NVD devolve em ordem cronológica crescente, a última página tem os mais novos.
+        """
+        dados = self._get({**params, "resultsPerPage": PAGINA, "startIndex": 0})
+        total = int(dados.get("totalResults", 0))
+        itens = dados.get("vulnerabilities", [])
+        if total > PAGINA:
+            dados = self._get({**params, "resultsPerPage": PAGINA, "startIndex": total - PAGINA})
+            itens = dados.get("vulnerabilities", [])
+        return itens, total
+
+    def _buscar_recentes(
+        self, params: dict, severidade: str | None, limite: int
+    ) -> ResultadoBusca:
+        base = self._com_severidade(params, severidade)
+        # Arredondado para a hora, para as chaves de cache se repetirem dentro da mesma hora.
+        fim = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0, tzinfo=None)
+
+        coletados: dict[str, dict] = {}
+        total_periodo = 0
+        janelas = 0
+        for _ in range(MAX_JANELAS):
+            inicio = fim - timedelta(days=JANELA_DIAS)
+            janela = {**base, "pubStartDate": _fmt_data(inicio), "pubEndDate": _fmt_data(fim)}
+            itens, total = self._pagina_final(janela)
+            janelas += 1
+            total_periodo += total
+            for item in itens:
+                cve = self._simplificar(item)
+                coletados[cve["id"]] = cve
+            if len(coletados) >= limite:
+                break
+            fim = inicio - timedelta(seconds=1)
+
+        if coletados:
+            return ResultadoBusca(
+                _melhores(list(coletados.values()), limite), total_periodo, janelas * JANELA_DIAS
+            )
+
+        # Nada no último ano: busca sem filtro de data, pegando os mais novos disponíveis.
+        itens, total = self._pagina_final(base)
+        cves = [self._simplificar(i) for i in itens]
+        return ResultadoBusca(_melhores(cves, limite), total, None)
 
     def _aguardar_vaga(self) -> None:
         """Bloqueia até haver vaga na janela de requisições."""
@@ -193,3 +256,12 @@ class NVDClient:
             "status": cve.get("vulnStatus", "-"),
             "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
         }
+
+
+def _melhores(cves: list[dict], limite: int) -> list[dict]:
+    """Ordena por pontuação CVSS (maior primeiro) e, em empate, pelos mais recentes."""
+    return sorted(
+        cves,
+        key=lambda c: (c["score"] if c["score"] is not None else -1, c["publicado"]),
+        reverse=True,
+    )[:limite]

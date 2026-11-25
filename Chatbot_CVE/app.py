@@ -75,7 +75,7 @@ with st.sidebar:
 # ----------------------------------------------------------------------
 # Chat
 # ----------------------------------------------------------------------
-st.title("🛡️ Consulta de CVE")
+st.title("🛡️ Consulta de Vulnerabilidades (CVE)")
 st.caption("Dados da NVD (NIST). Descrições em inglês, como publicadas na fonte.")
 
 if "historico" not in st.session_state:
@@ -88,15 +88,17 @@ for msg in st.session_state.historico:
             render_cve(cve)
 
 if pergunta := st.chat_input("Ex.: CVE-2021-44228 é crítico?"):
-    st.session_state.historico.append({"papel": "user", "texto": pergunta})
+    # Cada modo só enxerga a própria conversa (evita misturar respostas das duas versões).
+    historico_previo = [m for m in st.session_state.historico if m.get("modo") == modo]
+    st.session_state.historico.append({"papel": "user", "texto": pergunta, "modo": modo})
 
     inicio = time.perf_counter()
     with st.spinner("Consultando a NVD..."):
-        resp = motores[modo].responder(pergunta)
+        resp = motores[modo].responder(pergunta, historico_previo)
     tempo_ms = (time.perf_counter() - inicio) * 1000
 
     registrar(modo, pergunta, tempo_ms, resp)
     st.session_state.historico.append(
-        {"papel": "assistant", "texto": resp.texto, "cves": resp.cves}
+        {"papel": "assistant", "texto": resp.texto, "cves": resp.cves, "modo": modo}
     )
     st.rerun()

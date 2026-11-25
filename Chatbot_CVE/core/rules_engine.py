@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 
 from .models import EngineResponse
-from .nvd_client import NVDClient, NVDError
+from .nvd_client import NVDClient, NVDError, ResultadoBusca
 
 CVE_RE = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
 CPE_RE = re.compile(r"cpe:2\.3:[aho]:\S+", re.IGNORECASE)
@@ -43,7 +43,8 @@ class RulesEngine:
     def __init__(self, nvd: NVDClient) -> None:
         self.nvd = nvd
 
-    def responder(self, pergunta: str) -> EngineResponse:
+    def responder(self, pergunta: str, historico: list[dict] | None = None) -> EngineResponse:
+        # `historico` é ignorado de propósito: a versão por regras não tem memória da conversa.
         texto = pergunta.strip()
         if not texto:
             return EngineResponse("Digite uma pergunta.", ok=False, erro="entrada_vazia")
@@ -62,8 +63,8 @@ class RulesEngine:
             # 2) CPE completo
             m = CPE_RE.search(texto)
             if m:
-                cves, total = self.nvd.search_cpe(m.group(0), severidade=self._severidade(texto))
-                return self._resposta_lista(cves, total, "esse CPE")
+                res = self.nvd.search_cpe(m.group(0), severidade=self._severidade(texto))
+                return self._resposta_lista(res, "esse CPE")
 
             # 3) Comando "buscar"
             tokens = re.findall(r"[\w/çáéíóúãõâêôà.-]+", texto.lower())
@@ -72,8 +73,8 @@ class RulesEngine:
                 termo = " ".join(t for t in tokens[1:] if t not in SEVERIDADES)
                 if not termo:
                     return EngineResponse(TEXTO_AJUDA, ok=False, erro="termo_vazio")
-                cves, total = self.nvd.search_keyword(termo, severidade=severidade)
-                return self._resposta_lista(cves, total, f"“{termo}”")
+                res = self.nvd.search_keyword(termo, severidade=severidade)
+                return self._resposta_lista(res, f"“{termo}”")
 
             # 4) Ajuda ou formato não reconhecido
             if tokens and tokens[0] in COMANDOS_AJUDA:
@@ -93,11 +94,12 @@ class RulesEngine:
         return None
 
     @staticmethod
-    def _resposta_lista(cves: list[dict], total: int, alvo: str) -> EngineResponse:
-        if not cves:
+    def _resposta_lista(res: ResultadoBusca, alvo: str) -> EngineResponse:
+        if not res.cves:
             return EngineResponse(f"Nenhum CVE encontrado para {alvo}.", ok=False, erro="sem_resultados")
+        periodo = f"nos últimos {res.dias} dias" if res.dias else "no total (sem filtro de período)"
         return EngineResponse(
-            f"A NVD tem {total} resultado(s) para {alvo}. Mostrando os {len(cves)} de maior pontuação "
-            "entre os primeiros retornados.",
-            cves,
+            f"A NVD tem {res.total} resultado(s) para {alvo} {periodo}. "
+            f"Mostrando os {len(res.cves)} de maior pontuação entre os mais recentes.",
+            res.cves,
         )
